@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -1380,7 +1380,10 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 Ok(Some(metadata)) => {
                     // TODO(konsti): Prefer a higher-ranked variant of this version even when
                     // the installed variant is still compatible.
-                    preview_variants && metadata.compatible_wheel_label(&HashSet::new()).is_some()
+                    preview_variants
+                        && metadata
+                            .compatible_wheel_label(&metadata.static_supported_properties())
+                            .is_some()
                 }
                 Ok(None) => !preview_variants,
                 Err(_) => false,

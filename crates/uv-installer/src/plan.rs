@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -825,8 +824,9 @@ fn installed_variant_matches(installed: &InstalledDist, dist: &ResolvedDist) -> 
     let variant = dist.wheel_filename().and_then(WheelFilename::variant);
     match installed.read_variant() {
         Ok(None) => variant.is_none(),
-        Ok(Some(metadata)) => variant
-            .is_some_and(|label| metadata.compatible_wheel_label(&HashSet::new()) == Some(label)),
+        Ok(Some(metadata)) => variant.is_some_and(|label| {
+            metadata.compatible_wheel_label(&metadata.static_supported_properties()) == Some(label)
+        }),
         Err(_) => false,
     }
 }
