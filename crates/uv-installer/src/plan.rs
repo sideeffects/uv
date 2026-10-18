@@ -10,7 +10,7 @@ use uv_cache_info::Timestamp;
 use uv_configuration::{BuildOptions, Reinstall};
 use uv_distribution::{
     BuiltWheelIndex, HttpArchivePointer, PathArchivePointer, RegistryWheelIndex,
-    check_supported_wheel_variant,
+    check_supported_wheel_variant, supported_variant_properties,
 };
 use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
@@ -825,7 +825,7 @@ fn installed_variant_matches(installed: &InstalledDist, dist: &ResolvedDist) -> 
     match installed.read_variant() {
         Ok(None) => variant.is_none(),
         Ok(Some(metadata)) => variant.is_some_and(|label| {
-            metadata.compatible_wheel_label(&metadata.static_supported_properties()) == Some(label)
+            metadata.compatible_wheel_label(&supported_variant_properties(&metadata)) == Some(label)
         }),
         Err(_) => false,
     }
