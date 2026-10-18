@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use uv_cache_info::Timestamp;
 use uv_configuration::{BuildOptions, Reinstall};
 use uv_distribution::{
     BuiltWheelIndex, HttpArchivePointer, PathArchivePointer, RegistryWheelIndex,
+    check_supported_wheel_variant,
 };
 use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
@@ -341,14 +343,10 @@ impl<'a> Planner<'a> {
         //    So, e.g., if a package is marked as `--reinstall`, we _expect_ that it's not passed in
         //    as [`ResolvedDist::Installed`] here.
         for dist in self.resolution.distributions() {
-            // TODO(konsti): Support installing wheel variants.
-            if let Some(filename) = dist.wheel_filename()
-                && filename.variant().is_some()
+            if let ResolvedDist::Installable { dist, .. } = dist
+                && let Dist::Built(built) = dist.as_ref()
             {
-                return Err(uv_distribution::Error::UnsupportedWheelVariant(Box::new(
-                    filename.clone(),
-                ))
-                .into());
+                check_supported_wheel_variant(built)?;
             }
             // Check if the package should be reinstalled.
             let reinstall = reinstall.contains_package(dist.name())
@@ -389,8 +387,13 @@ impl<'a> Planner<'a> {
                                 );
                             }
                             RequirementSatisfaction::Satisfied => {
-                                debug!("Requirement already installed: {installed}");
-                                continue;
+                                if installed_variant_matches(installed, dist) {
+                                    debug!("Requirement already installed: {installed}");
+                                    continue;
+                                }
+                                debug!(
+                                    "Installed wheel variant differs from the resolved distribution: {installed}"
+                                );
                             }
                             RequirementSatisfaction::OutOfDate => {
                                 debug!("Requirement installed, but not fresh: {installed}");
@@ -806,6 +809,25 @@ impl<'a> Planner<'a> {
             reinstalls,
             extraneous,
         })
+    }
+}
+
+/// Check whether an installed wheel is the variant selected by the resolver.
+///
+/// For platform tags, the user chooses a target and we treat any compatible wheel as
+/// interchangeable. Variant wheels can provide different capabilities, and the user can
+/// change which variant they prefer even when the package version stays the same.
+fn installed_variant_matches(installed: &InstalledDist, dist: &ResolvedDist) -> bool {
+    if let ResolvedDist::Installed { .. } = dist {
+        return true;
+    }
+
+    let variant = dist.wheel_filename().and_then(WheelFilename::variant);
+    match installed.read_variant() {
+        Ok(None) => variant.is_none(),
+        Ok(Some(metadata)) => variant
+            .is_some_and(|label| metadata.compatible_wheel_label(&HashSet::new()) == Some(label)),
+        Err(_) => false,
     }
 }
 

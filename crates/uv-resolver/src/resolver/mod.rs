@@ -2,13 +2,14 @@
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{mem, thread};
 
+use either::Either;
 use futures::{FutureExt, StreamExt};
 use itertools::Itertools;
 use papaya::{HashMap, ResizeMode};
@@ -19,7 +20,7 @@ use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Level, debug, info, instrument, trace, warn};
 
-use uv_configuration::{Constraints, DependencyModifiers};
+use uv_configuration::{Constraints, DependencyModifiers, IndexStrategy};
 use uv_distribution::{ArchiveMetadata, DistributionDatabase};
 use uv_distribution_types::{
     BuiltDist, DerivationChain, Dist, DistErrorKind, Identifier, IndexCapabilities, IndexLocations,
@@ -50,8 +51,8 @@ use crate::manifest::Manifest;
 use crate::pins::FilePins;
 use crate::preferences::{PreferenceSource, Preferences};
 use crate::prioritized_distribution::{
-    CompatibleDist, IncompatibleDist, IncompatibleSource, IncompatibleWheel, PythonRequirementKind,
-    RegistryVariantsJson, implied_markers,
+    CompatibleDist, IncompatibleDist, IncompatibleSource, IncompatibleWheel, PrioritizedDist,
+    PythonRequirementKind, RegistryVariantsJson, implied_markers,
 };
 use crate::pubgrub::{
     DependencySource, PubGrubDependency, PubGrubPackage, PubGrubPackageInner, PubGrubPriorities,
@@ -156,6 +157,15 @@ struct ResolverState<InstalledPackages: InstalledPackagesProvider> {
     options: Options,
     /// The reporter to use for this resolver.
     reporter: Option<Arc<dyn Reporter>>,
+}
+
+/// The result of checking a candidate version's wheel variants.
+#[derive(Default)]
+struct WheelVariantSelection<'a> {
+    /// The first distribution we can use, with variant compatibility applied.
+    distribution: Option<Cow<'a, PrioritizedDist>>,
+    /// Why we couldn't check all the variants, even if we found a usable distribution.
+    unavailable: Option<MetadataUnavailable>,
 }
 
 impl<'a, Context: BuildContext, InstalledPackages: InstalledPackagesProvider>
@@ -1221,15 +1231,9 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             return Ok(None);
         }
 
-        // If the URL points to a pre-built wheel, and the wheel's supported Python versions don't
-        // match our `Requires-Python`, mark it as incompatible.
+        // Check whether a wheel at a direct URL is compatible with the target environment.
         if let Dist::Built(dist) = &dist {
-            let filename = match &dist {
-                BuiltDist::Registry(dist) => &dist.best_wheel().filename,
-                BuiltDist::DirectUrl(dist) => &dist.filename,
-                BuiltDist::GitPath(dist) => &dist.filename,
-                BuiltDist::Path(dist) => &dist.filename,
-            };
+            let filename = dist.wheel_filename();
 
             // If the wheel does not cover a required environment, it is incompatible.
             if env.marker_environment().is_none() && !self.options.artifact_environments.is_empty()
@@ -1257,12 +1261,19 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 }
             }
 
-            // If the wheel's Python tag doesn't match the target Python, it's incompatible.
-            if !python_requirement.target().matches_wheel_tag(filename) {
+            let incompatible_tag = if filename.variant().is_some() {
+                // Selecting a wheel variant requires variant metadata from the index.
+                Some(IncompatibleTag::Variant)
+            } else if !python_requirement.target().matches_wheel_tag(filename) {
+                Some(IncompatibleTag::AbiPythonVersion)
+            } else {
+                None
+            };
+            if let Some(tag) = incompatible_tag {
                 return Ok(Some(ResolverVersion::Unavailable(
                     filename.version.clone(),
                     UnavailableVersion::IncompatibleDist(IncompatibleDist::Wheel(
-                        IncompatibleWheel::Tag(IncompatibleTag::AbiPythonVersion),
+                        IncompatibleWheel::Tag(tag),
                     )),
                 )));
             }
@@ -1349,6 +1360,86 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         ) else {
             // Short circuit: we couldn't find _any_ versions for a package.
             return Ok(None);
+        };
+
+        // Universal lockfiles cannot yet record the metadata needed to select a variant.
+        let specific_environment = env.marker_environment().is_some();
+        let preview_variants =
+            specific_environment && uv_preview::is_enabled(PreviewFeature::WheelVariants);
+
+        // Reuse a compatible installed variant without looking for a replacement on the index.
+        // Enabling variants can switch an ordinary wheel to a variant, and disabling them can
+        // switch back to an ordinary wheel, in both cases keeping the installed version.
+        let (candidate, installed_fallback) = if specific_environment
+            && let CandidateDist::Compatible(CompatibleDist::InstalledDist(installed)) =
+                candidate.dist()
+        {
+            let variant = installed.read_variant();
+            let installed_is_ordinary = matches!(variant, Ok(None));
+            let keep_installed = match variant {
+                Ok(Some(metadata)) => {
+                    // TODO(konsti): Prefer a higher-ranked variant of this version even when
+                    // the installed variant is still compatible.
+                    preview_variants && metadata.compatible_wheel_label(&HashSet::new()).is_some()
+                }
+                Ok(None) => !preview_variants,
+                Err(_) => false,
+            };
+            if keep_installed {
+                (candidate, None)
+            } else if let Some(alternative) = self.selector.select_no_preference(
+                name,
+                &Range::singleton(candidate.version().clone()),
+                version_maps,
+                env,
+            ) {
+                (alternative, installed_is_ordinary.then_some(candidate))
+            } else if installed_is_ordinary {
+                (candidate, None)
+            } else {
+                return Ok(Some(ResolverVersion::Unavailable(
+                    candidate.version().clone(),
+                    UnavailableVersion::IncompatibleDist(IncompatibleDist::Wheel(
+                        IncompatibleWheel::Tag(IncompatibleTag::Variant),
+                    )),
+                )));
+            }
+        } else {
+            (candidate, None)
+        };
+
+        // Check variant properties now that we have chosen a version. If we can't select a
+        // distribution, fall back to an installed ordinary wheel or mark this version unavailable.
+        let variant = if preview_variants && let Some(prioritized) = candidate.prioritized() {
+            self.select_wheel_variant(candidate.version(), prioritized, version_maps, requests)?
+        } else {
+            WheelVariantSelection::default()
+        };
+        let candidate = if let Some(prioritized) = &variant.distribution {
+            candidate.with_prioritized_dist(prioritized)
+        } else if installed_fallback.is_none()
+            && let Some(reason) = &variant.unavailable
+        {
+            return Ok(Some(ResolverVersion::Unavailable(
+                candidate.version().clone(),
+                self.record_unavailable_metadata(name, candidate.version(), reason),
+            )));
+        } else {
+            candidate
+        };
+
+        let candidate = if let Some(installed) = installed_fallback {
+            match candidate.compatible() {
+                // Replace an ordinary wheel only if we found a compatible variant.
+                Some(CompatibleDist::CompatibleWheel { wheel, .. })
+                    if wheel.filename.variant().is_some() =>
+                {
+                    candidate
+                }
+                Some(_) | None => installed,
+            }
+        } else {
+            candidate
         };
 
         let dist = match candidate.dist() {
@@ -1466,6 +1557,63 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
 
         let version = candidate.version().clone();
         Ok(Some(ResolverVersion::Unforked(version)))
+    }
+
+    /// Select a wheel using only the variant metadata from the index that supplied it.
+    fn select_wheel_variant<'a>(
+        &self,
+        version: &Version,
+        prioritized: &'a PrioritizedDist,
+        version_maps: &'a [VersionMap],
+        requests: &MetadataRequests,
+    ) -> Result<WheelVariantSelection<'a>, ResolveError> {
+        // With unsafe-best-match we know the version, but not necessarily the index: a wheel
+        // we passed over can become compatible once we know its variant properties. Revisit the
+        // indexes in order, stopping as soon as one has a distribution we can use.
+        let candidates = if self.selector.index_strategy() == &IndexStrategy::UnsafeBestMatch {
+            Either::Left(version_maps.iter().filter_map(|map| map.get(version)))
+        } else {
+            Either::Right(std::iter::once(prioritized))
+        };
+
+        let mut selection = WheelVariantSelection::default();
+        for dist in candidates {
+            // Queue all metadata requests for this candidate before waiting for any of them.
+            // A flat index can combine wheels from several sources, so keep each response
+            // paired with its source: the same variant label can mean different things on each.
+            // TODO(konsti): Prefetch `variants.json` alongside other candidate metadata so it
+            // is likely to be ready by the time we select a wheel.
+            let mut pending = Vec::new();
+            for variants_json in dist.variants_json_for_selection() {
+                let request = requests.request_variants_json(variants_json)?;
+                pending.push((&variants_json.index, request));
+            }
+            let responses: Vec<_> = pending
+                .into_iter()
+                .map(|(index, request)| (index, request.wait()))
+                .collect();
+            let mut metadata = Vec::with_capacity(responses.len());
+            for (index, response) in &responses {
+                match response.as_ref() {
+                    Ok(content) => metadata.push((*index, content)),
+                    Err(reason) => {
+                        // Keep the first error to report if no distribution works.
+                        selection.unavailable.get_or_insert_with(|| reason.clone());
+                    }
+                }
+            }
+            // Prefer a compatible variant from this index, then its ordinary wheel or sdist,
+            // before considering a distribution from the next index.
+            if let Some(variant) = dist.prioritize_variants(&metadata) {
+                selection.distribution = Some(Cow::Owned(variant));
+                break;
+            }
+            if dist.get().is_some() {
+                selection.distribution = Some(Cow::Borrowed(dist));
+                break;
+            }
+        }
+        Ok(selection)
     }
 
     /// Determine whether a candidate covers all supported platforms; and, if not, generate a fork.
