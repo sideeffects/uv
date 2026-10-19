@@ -1941,7 +1941,10 @@ fn tool_install_editable_rebuilds_explicit_local_directory() -> Result<()> {
     ");
 
     project.child("VERSION").write_str("0.2.0")?;
-    project.child("commands.txt").write_str("alpha\nbeta")?;
+    project.child("commands.txt").write_str(indoc! {"
+        alpha
+        beta
+    "})?;
     project
         .child("src")
         .child("dynamic_tool")
@@ -3478,7 +3481,10 @@ fn tool_install_git_lfs() {
         .with_filter((r"exit_code: -?[1-9]\d*", "exit_code: [ERROR_CODE]"))
         .with_filter((
             "(?s)(----- stderr -----).*?The source distribution `[^`]+` is missing Git LFS artifacts.*",
-            "$1\n[PREFIX]The source distribution `[DISTRIBUTION]` is missing Git LFS artifacts",
+            indoc! {"
+                $1
+                [PREFIX]The source distribution `[DISTRIBUTION]` is missing Git LFS artifacts"
+            },
         ));
 
     uv_snapshot!(context.filters(), context.tool_install()
@@ -6382,10 +6388,19 @@ fn tool_install_with_build_hashes() -> Result<()> {
             None,
             "py3-none-any",
             &[
-                ("hash_tool/cli.py", "def main():\n    print('tool-ok')\n"),
+                (
+                    "hash_tool/cli.py",
+                    indoc! {"
+                        def main():
+                            print('tool-ok')
+                    "},
+                ),
                 (
                     "hash_tool-1.0.0.dist-info/entry_points.txt",
-                    "[console_scripts]\nhash-tool = hash_tool.cli:main\n",
+                    indoc! {"
+                        [console_scripts]
+                        hash-tool = hash_tool.cli:main
+                    "},
                 ),
             ],
         );
