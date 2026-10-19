@@ -152,9 +152,7 @@ impl RequirementSatisfaction {
 
                 if *ext == DistExtension::Wheel
                     && let Ok(filename) = requested_url.filename()
-                    && let Ok(filename) = filename.parse::<WheelFilename>()
-                    && let Some(variant) = filename.variant()
-                    && !installed_variant_matches(distribution, Some(variant))
+                    && !installed_wheel_variant_matches(distribution, &filename)
                 {
                     return Self::Mismatch;
                 }
@@ -262,7 +260,7 @@ impl RequirementSatisfaction {
                 url: _,
                 git: requested_git,
                 install_path: requested_path,
-                ext: _,
+                ext,
             } => {
                 let InstalledDistKind::Url(InstalledDirectUrlDist { direct_url, .. }) =
                     &distribution.kind
@@ -335,6 +333,14 @@ impl RequirementSatisfaction {
                     );
                     return Self::OutOfDate;
                 }
+
+                if *ext == DistExtension::Wheel
+                    && let Some(filename) =
+                        requested_path.file_name().and_then(|name| name.to_str())
+                    && !installed_wheel_variant_matches(distribution, filename)
+                {
+                    return Self::Mismatch;
+                }
             }
             RequirementSource::Path {
                 install_path: requested_path,
@@ -386,13 +392,10 @@ impl RequirementSatisfaction {
                         return Self::CacheInvalid;
                     }
                 }
-                // An unchanged wheel can become incompatible when system variant properties change.
                 if *ext == DistExtension::Wheel
                     && let Some(filename) =
                         requested_path.file_name().and_then(|name| name.to_str())
-                    && let Ok(filename) = filename.parse::<WheelFilename>()
-                    && let Some(variant) = filename.variant()
-                    && !installed_variant_matches(distribution, Some(variant))
+                    && !installed_wheel_variant_matches(distribution, filename)
                 {
                     return Self::Mismatch;
                 }
@@ -493,6 +496,16 @@ impl RequirementSatisfaction {
         // Otherwise, assume the requirement is up-to-date.
         Self::Satisfied
     }
+}
+
+/// An unchanged wheel can become incompatible when system variant properties change.
+fn installed_wheel_variant_matches(installed: &InstalledDist, filename: &str) -> bool {
+    let Ok(filename) = filename.parse::<WheelFilename>() else {
+        return true;
+    };
+    filename
+        .variant()
+        .is_none_or(|variant| installed_variant_matches(installed, Some(variant)))
 }
 
 /// Check whether an installed wheel matches the requested variant and current system properties.
