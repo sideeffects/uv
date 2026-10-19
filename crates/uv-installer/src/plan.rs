@@ -10,7 +10,7 @@ use uv_cache_info::Timestamp;
 use uv_configuration::{BuildOptions, Reinstall};
 use uv_distribution::{
     BuiltWheelIndex, HttpArchivePointer, PathArchivePointer, RegistryWheelIndex,
-    check_supported_wheel_variant, supported_variant_properties,
+    check_supported_wheel_variant, check_wheel_variant_compatibility,
 };
 use uv_distribution_filename::WheelFilename;
 use uv_distribution_types::{
@@ -27,7 +27,7 @@ use uv_python_interpreter::PythonEnvironment;
 use uv_redacted::SafeUrl;
 use uv_types::HashStrategy;
 
-use crate::satisfies::{BuildSettings, RequirementSatisfaction};
+use crate::satisfies::{BuildSettings, RequirementSatisfaction, installed_variant_matches};
 use crate::{InstallationStrategy, SitePackages};
 
 /// A failure while determining which distributions to install.
@@ -386,7 +386,7 @@ impl<'a> Planner<'a> {
                                 );
                             }
                             RequirementSatisfaction::Satisfied => {
-                                if installed_variant_matches(installed, dist) {
+                                if resolved_variant_matches(installed, dist) {
                                     debug!("Requirement already installed: {installed}");
                                     continue;
                                 }
@@ -522,7 +522,7 @@ impl<'a> Planner<'a> {
                         return Err(Error::NotFound(wheel.url.to_url()).into());
                     }
 
-                    if !wheel.filename.is_compatible(tags) {
+                    if !wheel.filename.tag_compatibility(tags).is_compatible() {
                         return Err(PlanError::IncompatibleWheel(Box::new(
                             IncompatibleWheelError {
                                 kind: IncompatibleWheelKind::Path(wheel.install_path.to_path_buf()),
@@ -566,6 +566,10 @@ impl<'a> Planner<'a> {
                                             build_info,
                                             path: cache.archive(&archive.id).into_boxed_path(),
                                         };
+                                        check_wheel_variant_compatibility(
+                                            &cached_dist.filename,
+                                            &cached_dist.path,
+                                        )?;
                                         debug!(
                                             "Path wheel requirement already cached: {cached_dist}"
                                         );
@@ -816,19 +820,13 @@ impl<'a> Planner<'a> {
 /// For platform tags, the user chooses a target and we treat any compatible wheel as
 /// interchangeable. Variant wheels can provide different capabilities, and the user can
 /// change which variant they prefer even when the package version stays the same.
-fn installed_variant_matches(installed: &InstalledDist, dist: &ResolvedDist) -> bool {
+fn resolved_variant_matches(installed: &InstalledDist, dist: &ResolvedDist) -> bool {
     if let ResolvedDist::Installed { .. } = dist {
         return true;
     }
 
     let variant = dist.wheel_filename().and_then(WheelFilename::variant);
-    match installed.read_variant() {
-        Ok(None) => variant.is_none(),
-        Ok(Some(metadata)) => variant.is_some_and(|label| {
-            metadata.compatible_wheel_label(&supported_variant_properties(&metadata)) == Some(label)
-        }),
-        Err(_) => false,
-    }
+    installed_variant_matches(installed, variant)
 }
 
 /// Returns `true` if the given distribution is a seed package.
@@ -849,7 +847,7 @@ fn generate_wheel_compatibility_hint(
     filename: &WheelFilename,
     tags: &Tags,
 ) -> Option<IncompatibleWheelHint> {
-    let TagCompatibility::Incompatible(incompatible_tag) = filename.compatibility(tags) else {
+    let TagCompatibility::Incompatible(incompatible_tag) = filename.tag_compatibility(tags) else {
         return None;
     };
 

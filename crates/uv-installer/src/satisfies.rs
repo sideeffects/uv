@@ -6,7 +6,8 @@ use tracing::{debug, trace};
 
 use uv_cache_info::CacheInfo;
 use uv_cache_key::{CanonicalUrl, RepositoryUrl};
-use uv_distribution_filename::ExpandedTags;
+use uv_distribution::supported_variant_properties;
+use uv_distribution_filename::{DistExtension, ExpandedTags, VariantLabel, WheelFilename};
 use uv_distribution_types::{
     BuildInfo, BuildVariables, ConfigSettings, ExtraBuildRequirement, ExtraBuildRequires,
     ExtraBuildVariables, InstalledDirectUrlDist, InstalledDist, InstalledDistKind,
@@ -16,6 +17,7 @@ use uv_git_types::GitLfs;
 use uv_normalize::PackageName;
 use uv_pep440::Version;
 use uv_platform_tags::{AbiTag, IncompatibleTag, TagCompatibility, Tags};
+use uv_preview::PreviewFeature;
 use uv_pypi_types::{DirInfo, DirectUrl, VcsInfo, VcsKind};
 
 use crate::InstallationStrategy;
@@ -327,7 +329,7 @@ impl RequirementSatisfaction {
             }
             RequirementSource::Path {
                 install_path: requested_path,
-                ext: _,
+                ext,
                 url: _,
             } => {
                 let InstalledDistKind::Url(InstalledDirectUrlDist {
@@ -374,6 +376,16 @@ impl RequirementSatisfaction {
                         debug!("Failed to read cached requirement for: {distribution} ({err})");
                         return Self::CacheInvalid;
                     }
+                }
+                // An unchanged wheel can become incompatible when system variant properties change.
+                if *ext == DistExtension::Wheel
+                    && let Some(filename) =
+                        requested_path.file_name().and_then(|name| name.to_str())
+                    && let Ok(filename) = filename.parse::<WheelFilename>()
+                    && let Some(variant) = filename.variant()
+                    && !installed_variant_matches(distribution, Some(variant))
+                {
+                    return Self::Mismatch;
                 }
             }
             RequirementSource::Directory {
@@ -472,6 +484,23 @@ impl RequirementSatisfaction {
         // Otherwise, assume the requirement is up-to-date.
         Self::Satisfied
     }
+}
+
+/// Check whether an installed wheel matches the requested variant and current system properties.
+pub(crate) fn installed_variant_matches(
+    installed: &InstalledDist,
+    variant: Option<&VariantLabel>,
+) -> bool {
+    let metadata = match installed.read_variant() {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return variant.is_none(),
+        Err(_) => return false,
+    };
+    let Some(label) = variant else {
+        return false;
+    };
+    uv_preview::is_enabled(PreviewFeature::WheelVariants)
+        && metadata.compatible_wheel_label(&supported_variant_properties(&metadata)) == Some(label)
 }
 
 /// Determine the [`ConfigSettings`] for the given package name.
