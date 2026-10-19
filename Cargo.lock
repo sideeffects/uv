@@ -6521,6 +6521,7 @@ dependencies = [
  "bitflags 2.13.2",
  "fs-err",
  "http",
+ "insta",
  "itertools 0.14.0",
  "jiff",
  "memchr",
