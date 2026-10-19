@@ -18,11 +18,8 @@ fn null_variant() -> Value {
     })
 }
 
-/// Installing a local wheel checks its properties, including when reusing a cached extraction.
-#[test]
-fn install_local_variant_wheel() -> Result<()> {
-    let context = uv_test::test_context!("3.12");
-    let variant = json!({
+fn gpu_variant() -> Value {
+    json!({
         "$schema": PEP_850_SCHEMA,
         "default-priorities": { "namespace": ["nvidia"] },
         "providers": {
@@ -40,7 +37,13 @@ fn install_local_variant_wheel() -> Result<()> {
             }
         }
     })
-    .to_string();
+}
+
+/// Installing a local wheel checks its properties, including when reusing a cached extraction.
+#[test]
+fn install_local_variant_wheel() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let variant = gpu_variant().to_string();
     let (_, wheel) = WheelBuilder::new(&"ok".parse()?, &"1.0.0".parse()?)
         .files(&[("ok-1.0.0.dist-info/variant.json", &variant)])
         .build();
@@ -67,6 +70,49 @@ fn install_local_variant_wheel() -> Result<()> {
         .arg("--preview-features")
         .arg("wheel-variants")
         .arg(wheel_path.path()), @"
+    exit_code: 2 (failure)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    error: Failed to determine installation plan
+      cause: Wheel variant `gpu` requires unsupported properties: `nvidia :: cuda_version_lower_bound :: 12` and `nvidia :: sm_arch :: 89_real`
+    ");
+    Ok(())
+}
+
+/// A direct URL wheel is rechecked when the system's supported variant properties change.
+#[test]
+fn install_direct_url_variant_wheel() -> Result<()> {
+    let context = uv_test::test_context!("3.12");
+    let variant = gpu_variant().to_string();
+    let (_, wheel) = WheelBuilder::new(&"ok".parse()?, &"1.0.0".parse()?)
+        .files(&[("ok-1.0.0.dist-info/variant.json", &variant)])
+        .build();
+    let filename = "ok-1.0.0-py3-none-any-gpu.whl";
+    context.temp_dir.child(filename).write_binary(&wheel)?;
+    let server = FindLinksServer::new(context.temp_dir.path());
+    let url = format!("{}/{filename}", server.url());
+    let context = context.with_filter((server.url(), "http://[LOCALHOST]"));
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .env(EnvVars::NV_VARIANT_PROVIDER_FORCE_CUDA_DRIVER_VERSION, "12")
+        .env(EnvVars::NV_VARIANT_PROVIDER_FORCE_SM_ARCH, "8.9")
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg(&url), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 1 package in [TIME]
+    Prepared 1 package in [TIME]
+    Installed 1 package in [TIME]
+     + ok==1.0.0 (from http://[LOCALHOST]/ok-1.0.0-py3-none-any-gpu.whl)
+    ");
+
+    uv_snapshot!(context.filters(), context.pip_install()
+        .env(EnvVars::NV_VARIANT_PROVIDER_FORCE_CUDA_DRIVER_VERSION, "11")
+        .env(EnvVars::NV_VARIANT_PROVIDER_FORCE_SM_ARCH, "8.8")
+        .arg("--preview-features")
+        .arg("wheel-variants")
+        .arg(&url), @"
     exit_code: 2 (failure)
     ----- stderr -----
     Resolved 1 package in [TIME]

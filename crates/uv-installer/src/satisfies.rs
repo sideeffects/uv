@@ -11,7 +11,7 @@ use uv_distribution_filename::{DistExtension, ExpandedTags, VariantLabel, WheelF
 use uv_distribution_types::{
     BuildInfo, BuildVariables, ConfigSettings, ExtraBuildRequirement, ExtraBuildRequires,
     ExtraBuildVariables, InstalledDirectUrlDist, InstalledDist, InstalledDistKind,
-    PackageConfigSettings, RequirementSource,
+    PackageConfigSettings, RemoteSource, RequirementSource,
 };
 use uv_git_types::GitLfs;
 use uv_normalize::PackageName;
@@ -115,7 +115,7 @@ impl RequirementSatisfaction {
                 // records `"url": "https://github.com/tqdm/tqdm"` in `direct_url.json`.
                 location: requested_url,
                 subdirectory: requested_subdirectory,
-                ext: _,
+                ext,
                 url: _,
             } => {
                 let InstalledDistKind::Url(InstalledDirectUrlDist {
@@ -146,6 +146,15 @@ impl RequirementSatisfaction {
 
                 if CanonicalUrl::new(installed_url.as_url().clone())
                     != CanonicalUrl::new(requested_url.as_url().clone())
+                {
+                    return Self::Mismatch;
+                }
+
+                if *ext == DistExtension::Wheel
+                    && let Ok(filename) = requested_url.filename()
+                    && let Ok(filename) = filename.parse::<WheelFilename>()
+                    && let Some(variant) = filename.variant()
+                    && !installed_variant_matches(distribution, Some(variant))
                 {
                     return Self::Mismatch;
                 }
